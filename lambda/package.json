@@ -1,0 +1,9 @@
+{
+  "name": "video-processor-orchestrator",
+  "version": "1.0.0",
+  "description": "Lambda orchestrator for video processing pipeline",
+  "main": "index.js",
+  "dependencies": {
+    "@aws-sdk/client-ecs": "^3.500.0"
+  }
+}

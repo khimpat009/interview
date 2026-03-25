@@ -1,0 +1,253 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >
+  Video Processing POC — Detection & Masking Pipeline
+  (S3 → Lambda → ECS Fargate)
+
+# ============================================================
+# Parameters
+# ============================================================
+Parameters:
+  ProjectName:
+    Type: String
+    Default: video-processor
+    Description: Prefix used for all resource names
+
+  VpcId:
+    Type: AWS::EC2::VPC::Id
+    Description: VPC for ECS Fargate tasks
+
+  SubnetIds:
+    Type: List<AWS::EC2::Subnet::Id>
+    Description: Public subnets (need internet access for S3 / ECR)
+
+# ============================================================
+# Resources
+# ============================================================
+Resources:
+
+  # -------------------- ECR --------------------
+  ECRRepository:
+    Type: AWS::ECR::Repository
+    Properties:
+      RepositoryName: !Sub ${ProjectName}
+
+  # -------------------- S3 --------------------
+  VideoBucket:
+    Type: AWS::S3::Bucket
+    DependsOn: LambdaInvokePermission
+    Properties:
+      BucketName: !Sub ${ProjectName}-${AWS::AccountId}-${AWS::Region}
+      NotificationConfiguration:
+        LambdaConfigurations:
+          - Event: s3:ObjectCreated:*
+            Filter:
+              S3Key:
+                Rules:
+                  - Name: prefix
+                    Value: input/
+                  - Name: suffix
+                    Value: .mp4
+            Function: !GetAtt OrchestratorFunction.Arn
+
+  # -------------------- IAM — Lambda --------------------
+  LambdaRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub ${ProjectName}-lambda-role
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: ECSRunTask
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - ecs:RunTask
+                Resource:
+                  - !Sub arn:aws:ecs:${AWS::Region}:${AWS::AccountId}:task-definition/${ProjectName}*
+              - Effect: Allow
+                Action:
+                  - iam:PassRole
+                Resource:
+                  - !GetAtt TaskExecutionRole.Arn
+                  - !GetAtt TaskRole.Arn
+
+  # -------------------- IAM — ECS Task Execution --------------------
+  TaskExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub ${ProjectName}-task-exec-role
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ecs-tasks.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AmazonECSTaskExecutionRolePolicy
+
+  # -------------------- IAM — ECS Task (S3 access) --------------------
+  TaskRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub ${ProjectName}-task-role
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ecs-tasks.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: S3ReadWrite
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:PutObject
+                Resource:
+                  - !Sub arn:aws:s3:::${ProjectName}-${AWS::AccountId}-${AWS::Region}/*
+
+  # -------------------- Lambda --------------------
+  OrchestratorFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub ${ProjectName}-orchestrator
+      Runtime: nodejs20.x
+      Handler: index.handler
+      Role: !GetAtt LambdaRole.Arn
+      Timeout: 30
+      MemorySize: 128
+      Environment:
+        Variables:
+          ECS_CLUSTER: !GetAtt ECSCluster.Arn
+          TASK_DEFINITION: !Ref VideoProcessorTaskDefinition
+          SUBNETS: !Join [",", !Ref SubnetIds]
+          SECURITY_GROUP: !GetAtt ProcessorSecurityGroup.GroupId
+          OUTPUT_BUCKET: !Sub ${ProjectName}-${AWS::AccountId}-${AWS::Region}
+      Code:
+        ZipFile: |
+          const { ECSClient, RunTaskCommand } = require('@aws-sdk/client-ecs');
+          const ecs = new ECSClient();
+
+          exports.handler = async (event) => {
+            console.log('S3 event:', JSON.stringify(event));
+
+            for (const record of event.Records) {
+              const bucket = record.s3.bucket.name;
+              const key = decodeURIComponent(record.s3.object.key.replace(/\+/g, ' '));
+              if (!key.toLowerCase().endsWith('.mp4')) continue;
+
+              console.log(`Launching ECS task for s3://${bucket}/${key}`);
+
+              const result = await ecs.send(new RunTaskCommand({
+                cluster: process.env.ECS_CLUSTER,
+                taskDefinition: process.env.TASK_DEFINITION,
+                launchType: 'FARGATE',
+                networkConfiguration: {
+                  awsvpcConfiguration: {
+                    subnets: process.env.SUBNETS.split(','),
+                    securityGroups: [process.env.SECURITY_GROUP],
+                    assignPublicIp: 'ENABLED'
+                  }
+                },
+                overrides: {
+                  containerOverrides: [{
+                    name: 'video-processor',
+                    environment: [
+                      { name: 'INPUT_BUCKET', value: bucket },
+                      { name: 'INPUT_KEY', value: key },
+                      { name: 'OUTPUT_BUCKET', value: process.env.OUTPUT_BUCKET }
+                    ]
+                  }]
+                }
+              }));
+
+              console.log('Task ARN:', result.tasks?.map(t => t.taskArn));
+            }
+
+            return { statusCode: 200 };
+          };
+
+  LambdaInvokePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !GetAtt OrchestratorFunction.Arn
+      Action: lambda:InvokeFunction
+      Principal: s3.amazonaws.com
+      SourceArn: !Sub arn:aws:s3:::${ProjectName}-${AWS::AccountId}-${AWS::Region}
+
+  # -------------------- ECS --------------------
+  ECSCluster:
+    Type: AWS::ECS::Cluster
+    Properties:
+      ClusterName: !Sub ${ProjectName}-cluster
+
+  ProcessorSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: !Sub ${ProjectName} ECS tasks - outbound only
+      VpcId: !Ref VpcId
+      SecurityGroupEgress:
+        - IpProtocol: "-1"
+          CidrIp: 0.0.0.0/0
+          Description: Allow all outbound (S3, ECR, CloudWatch)
+
+  LogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub /ecs/${ProjectName}
+      RetentionInDays: 7
+
+  VideoProcessorTaskDefinition:
+    Type: AWS::ECS::TaskDefinition
+    Properties:
+      Family: !Sub ${ProjectName}
+      Cpu: "4096"
+      Memory: "8192"
+      NetworkMode: awsvpc
+      RequiresCompatibilities:
+        - FARGATE
+      ExecutionRoleArn: !GetAtt TaskExecutionRole.Arn
+      TaskRoleArn: !GetAtt TaskRole.Arn
+      ContainerDefinitions:
+        - Name: video-processor
+          Image: !Sub ${AWS::AccountId}.dkr.ecr.${AWS::Region}.amazonaws.com/${ECRRepository}:latest
+          Essential: true
+          LogConfiguration:
+            LogDriver: awslogs
+            Options:
+              awslogs-group: !Ref LogGroup
+              awslogs-region: !Ref AWS::Region
+              awslogs-stream-prefix: ecs
+
+# ============================================================
+# Outputs
+# ============================================================
+Outputs:
+  BucketName:
+    Description: S3 bucket for input/output videos
+    Value: !Ref VideoBucket
+
+  ECRRepositoryUri:
+    Description: ECR repository URI for the container image
+    Value: !Sub ${AWS::AccountId}.dkr.ecr.${AWS::Region}.amazonaws.com/${ECRRepository}
+
+  ECSClusterName:
+    Description: ECS cluster name
+    Value: !Ref ECSCluster
+
+  LambdaFunctionName:
+    Description: Orchestrator Lambda function
+    Value: !Ref OrchestratorFunction
