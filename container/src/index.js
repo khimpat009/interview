@@ -25,7 +25,7 @@ async function main() {
   await detector.init();
 
   // 3. Process video (detect + mask)
-  const processor = new VideoProcessor(detector, config.blurSigma);
+  const processor = new VideoProcessor(detector, config.blurSigma, config.detectInterval);
   const results = await processor.process(inputPath, outputPath, workDir);
 
   // 4. Determine output keys

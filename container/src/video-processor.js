@@ -3,11 +3,13 @@ const sharp = require("sharp");
 const fs = require("fs");
 const fsp = require("fs/promises");
 const path = require("path");
+const { Tracker } = require("./tracker");
 
 class VideoProcessor {
-  constructor(detector, blurSigma = 25) {
+  constructor(detector, blurSigma = 25, detectInterval = 3) {
     this.detector = detector;
     this.blurSigma = blurSigma;
+    this.detectInterval = Math.max(1, detectInterval);
   }
 
   /**
@@ -33,10 +35,17 @@ class VideoProcessor {
       .sort();
     console.log(`Extracted ${frameFiles.length} frames`);
 
-    // 3. Detect & blur each frame
+    // 3. Detect & blur each frame (with motion tracking for faces)
+    //    Run YOLO only on key frames (every N-th); use tracker prediction
+    //    on skipped frames for efficiency.
     const allDetections = {};
     let framesWithDetections = 0;
     let totalDetections = 0;
+    let framesDetected = 0;
+    const tracker = new Tracker();
+    let lastPlateRegions = [];
+
+    console.log(`Detect interval: every ${this.detectInterval} frame(s)`);
 
     for (let i = 0; i < frameFiles.length; i++) {
       const file = frameFiles[i];
@@ -47,13 +56,39 @@ class VideoProcessor {
         console.log(`Processing frame ${i + 1} / ${frameFiles.length}...`);
       }
 
-      const { detections, maskRegions } =
-        await this.detector.detect(framePath);
+      const isKeyFrame = i % this.detectInterval === 0;
+      let detections = [];
+      let trackedRegions;
 
-      if (maskRegions.length > 0) {
+      if (isKeyFrame) {
+        // Key frame: run YOLO detection + tracker update
+        const result = await this.detector.detect(framePath);
+        detections = result.detections;
+
+        trackedRegions = tracker.process(
+          result.maskRegions,
+          videoInfo.width,
+          videoInfo.height
+        );
+
+        // Remember plate regions for skipped frames
+        lastPlateRegions = trackedRegions.filter(
+          (r) => r.type === "license_plate"
+        );
+        framesDetected++;
+      } else {
+        // Skipped frame: predict all tracks using velocity
+        trackedRegions = tracker.predictAll(
+          videoInfo.width,
+          videoInfo.height,
+          lastPlateRegions
+        );
+      }
+
+      if (trackedRegions.length > 0) {
         framesWithDetections++;
-        totalDetections += maskRegions.length;
-        await this.applyBlur(framePath, outFramePath, maskRegions);
+        totalDetections += trackedRegions.length;
+        await this.applyBlur(framePath, outFramePath, trackedRegions);
       } else {
         await fsp.copyFile(framePath, outFramePath);
       }
@@ -61,9 +96,11 @@ class VideoProcessor {
       allDetections[file] = {
         frameNumber: i + 1,
         detections,
-        maskRegions,
+        maskRegions: trackedRegions,
       };
     }
+
+    console.log(`YOLO ran on ${framesDetected} / ${frameFiles.length} frames (interval=${this.detectInterval})`);
 
     // 4. Reassemble video
     console.log("Reassembling video with FFmpeg...");

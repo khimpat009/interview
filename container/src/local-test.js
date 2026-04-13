@@ -32,13 +32,14 @@ async function main() {
   const modelPath = process.env.MODEL_PATH || "/app/models/yolov8n.onnx";
   const confidence = parseFloat(process.env.CONFIDENCE_THRESHOLD || "0.4");
   const blurSigma = parseInt(process.env.BLUR_SIGMA || "25", 10);
+  const detectInterval = parseInt(process.env.DETECT_INTERVAL || "1", 10);
 
   // Initialise detector
   const detector = new Detector(modelPath, confidence);
   await detector.init();
 
   // Process
-  const processor = new VideoProcessor(detector, blurSigma);
+  const processor = new VideoProcessor(detector, blurSigma, detectInterval);
   const results = await processor.process(inputPath, outputVideoPath, workDir);
 
   // Write detections JSON

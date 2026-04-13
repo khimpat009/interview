@@ -4,6 +4,7 @@ const sharp = require("sharp");
 // COCO classes of interest
 const PERSON_CLASS = 0;
 const VEHICLE_CLASSES = [2, 3, 5, 7]; // car, motorcycle, bus, truck
+const ALL_CLASSES = new Set([PERSON_CLASS, ...VEHICLE_CLASSES]);
 const CLASS_NAMES = {
   0: "person",
   2: "car",
@@ -110,8 +111,7 @@ class Detector {
       }
 
       if (maxScore < this.confidenceThreshold) continue;
-      if (classId !== PERSON_CLASS && !VEHICLE_CLASSES.includes(classId))
-        continue;
+      if (!ALL_CLASSES.has(classId)) continue;
 
       // Map back to original image coordinates
       const x1 = Math.max(0, (xc - w / 2 - padX) / scale);
@@ -131,20 +131,22 @@ class Detector {
   }
 
   /* ------------------------------------------------------------------ */
-  /*  Build mask regions from detections                                 */
+  /*  Build mask regions — faces from persons, plates from vehicles      */
   /* ------------------------------------------------------------------ */
   buildMaskRegions(detections, imgWidth, imgHeight) {
     const regions = [];
 
     for (const det of detections) {
       if (det.classId === PERSON_CLASS) {
-        regions.push({
-          type: "person",
-          confidence: det.confidence,
-          bbox: det.bbox,
-        });
+        const face = this.estimateFaceRegion(det.bbox, imgWidth, imgHeight);
+        if (face) {
+          regions.push({
+            type: "face",
+            confidence: det.confidence,
+            bbox: face,
+          });
+        }
       } else if (VEHICLE_CLASSES.includes(det.classId)) {
-        // Estimate license plate area within the vehicle bounding box
         const plate = this.estimatePlateRegion(det.bbox, imgWidth, imgHeight);
         if (plate) {
           regions.push({
@@ -160,9 +162,56 @@ class Detector {
     return regions;
   }
 
+  estimateFaceRegion(personBbox, imgWidth, imgHeight) {
+    const { x1, y1, x2, y2 } = personBbox;
+    const pw = x2 - x1;
+    const ph = y2 - y1;
+
+    // Aspect ratio: tall person (standing) vs wide/short (close-up, sitting)
+    const aspect = ph / (pw || 1);
+
+    let faceHeightRatio, faceWidthInset;
+    if (aspect > 2.5) {
+      // Full body — face is small relative to bbox
+      faceHeightRatio = 0.18;
+      faceWidthInset = 0.20;
+    } else if (aspect > 1.5) {
+      // Half body — moderate face size
+      faceHeightRatio = 0.25;
+      faceWidthInset = 0.18;
+    } else {
+      // Close-up / upper body — face fills more of the bbox
+      faceHeightRatio = 0.35;
+      faceWidthInset = 0.15;
+    }
+
+    // Core face estimate
+    let faceX1 = x1 + pw * faceWidthInset;
+    let faceX2 = x2 - pw * faceWidthInset;
+    let faceY1 = y1;
+    let faceY2 = y1 + ph * faceHeightRatio;
+
+    // Add 20% padding to handle estimation errors
+    const padW = (faceX2 - faceX1) * 0.20;
+    const padH = (faceY2 - faceY1) * 0.20;
+    faceX1 -= padW;
+    faceX2 += padW;
+    faceY1 -= padH;
+    faceY2 += padH;
+
+    if (faceX2 - faceX1 < 6 || faceY2 - faceY1 < 6) return null;
+
+    return {
+      x1: Math.max(0, faceX1),
+      y1: Math.max(0, faceY1),
+      x2: Math.min(imgWidth, faceX2),
+      y2: Math.min(imgHeight, faceY2),
+    };
+  }
+
   /**
-   * Heuristic: license plate is typically in the lower-center portion of
-   * a vehicle bounding box.
+   * Estimate the license plate region within a vehicle bounding box.
+   * Plate is typically in the lower-center portion.
    */
   estimatePlateRegion(vehicleBbox, imgWidth, imgHeight) {
     const { x1, y1, x2, y2 } = vehicleBbox;
@@ -184,9 +233,6 @@ class Detector {
     };
   }
 
-  /* ------------------------------------------------------------------ */
-  /*  Non-Maximum Suppression                                            */
-  /* ------------------------------------------------------------------ */
   nms(detections) {
     const byClass = {};
     for (const d of detections) {

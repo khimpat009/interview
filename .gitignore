@@ -3,5 +3,6 @@ node_modules/
 *.onnx
 tmp/
 dist/
+input/
 output/
 .DS_Store
